@@ -11,593 +11,1124 @@ const PORT = process.env.PORT || 3000;
 // ============================================================
 
 const MAX_HISTORICO_POR_EXECUCAO = 500;
+const MAX_EXECUCOES = 1000;
 
-const CLIENTES_SSE = new Map();
+// ============================================================
+// MEMÓRIA
+// ============================================================
+
+// execucao_id -> execução
+const EXECUCOES = new Map();
+
+// execucao_id -> array de eventos
 const HISTORICO = new Map();
 
+// execucao_id -> Set de conexões SSE
+const CLIENTES_SSE = new Map();
 
 // ============================================================
 // MIDDLEWARE
 // ============================================================
 
 app.use(
-    cors({
-        origin: true,
-        credentials: true
-    })
+  cors({
+    origin: true,
+    credentials: true,
+  })
 );
 
 app.use(
-    express.json({
-        limit: "1mb"
-    })
+  express.json({
+    limit: "1mb",
+  })
 );
-
 
 // ============================================================
 // FUNÇÕES AUXILIARES
 // ============================================================
 
-function gerarIdEvento() {
-    return crypto.randomUUID();
+function gerarId() {
+  return crypto.randomUUID();
 }
-
 
 function normalizarNivel(level) {
-    const niveis = [
-        "info",
-        "success",
-        "warn",
-        "error"
-    ];
+  const niveis = [
+    "info",
+    "success",
+    "warn",
+    "error",
+  ];
 
-    if (niveis.includes(level)) {
-        return level;
-    }
-
-    return "info";
+  return niveis.includes(level)
+    ? level
+    : "info";
 }
 
+function normalizarStatus(status) {
+  const statusValidos = [
+    "running",
+    "completed",
+    "error",
+    "cancelled",
+  ];
+
+  return statusValidos.includes(status)
+    ? status
+    : "running";
+}
 
 function criarEvento(dados) {
-    return {
-        id: gerarIdEvento(),
+  return {
+    id: gerarId(),
 
-        execucao_id:
-            dados.execucao_id || null,
+    execucao_id:
+      dados.execucao_id || null,
 
-        usuario:
-            dados.usuario || null,
+    usuario:
+      dados.usuario || null,
 
-        detentora:
-            dados.detentora || null,
+    detentora:
+      dados.detentora || null,
 
-        message:
-            String(dados.message || ""),
+    arquivo:
+      dados.arquivo || null,
 
-        level:
-            normalizarNivel(dados.level),
+    message:
+      String(dados.message || ""),
 
-        event:
-            dados.event || "log",
+    level:
+      normalizarNivel(dados.level),
 
-        timestamp:
-            dados.timestamp ||
-            new Date().toISOString()
-    };
+    event:
+      dados.event || "log",
+
+    timestamp:
+      dados.timestamp ||
+      new Date().toISOString(),
+  };
 }
 
+// ============================================================
+// LIMPEZA DE EXECUÇÕES ANTIGAS
+// ============================================================
+
+function limitarExecucoes() {
+  if (EXECUCOES.size <= MAX_EXECUCOES) {
+    return;
+  }
+
+  const execucoes = Array.from(
+    EXECUCOES.values()
+  );
+
+  execucoes.sort(
+    (a, b) =>
+      new Date(a.updated_at) -
+      new Date(b.updated_at)
+  );
+
+  const quantidadeRemover =
+    EXECUCOES.size - MAX_EXECUCOES;
+
+  for (
+    let i = 0;
+    i < quantidadeRemover;
+    i++
+  ) {
+    const execucao =
+      execucoes[i];
+
+    EXECUCOES.delete(
+      execucao.execucao_id
+    );
+
+    HISTORICO.delete(
+      execucao.execucao_id
+    );
+  }
+}
+
+// ============================================================
+// ROTA PRINCIPAL
+// ============================================================
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "online",
+    service: "SGA Backend",
+    version: "2.0.0",
+    timestamp:
+      new Date().toISOString(),
+  });
+});
 
 // ============================================================
 // HEALTH CHECK
 // ============================================================
 
-app.get("/", (req, res) => {
-
-    res.json({
-        status: "online",
-        service: "SGA Backend",
-        timestamp: new Date().toISOString()
-    });
-
-});
-
-
 app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
 
-    res.json({
-        status: "ok",
-        timestamp: new Date().toISOString(),
-        clientes_sse: contarClientes(),
-        execucoes_ativas: HISTORICO.size
-    });
+    timestamp:
+      new Date().toISOString(),
 
+    clientes_sse:
+      contarClientes(),
+
+    execucoes:
+      EXECUCOES.size,
+  });
 });
 
-
 // ============================================================
-// POST /api/logs
-// ============================================================
-//
-// Recebe os logs enviados pelo monitor.py
-//
-// Exemplo:
-//
-// {
-//   "execucao_id": "ATC-20260909-143201-1234",
-//   "usuario": "Pedro Ferreira",
-//   "detentora": "atc",
-//   "message": "[LOGIN] Login realizado",
-//   "level": "info"
-// }
-//
+// CRIAR EXECUÇÃO
 // ============================================================
 
-app.post("/api/logs", (req, res) => {
+app.post(
+  "/api/executions",
+  (req, res) => {
 
     try {
 
-        const {
-            message,
-            level,
-            execucao_id,
-            usuario,
-            detentora,
-            event,
-            timestamp
-        } = req.body;
+      const {
+        execucao_id,
+        usuario,
+        detentora,
+        arquivo,
+      } = req.body;
 
-
-        // ----------------------------------------------------
-        // VALIDAÇÃO
-        // ----------------------------------------------------
-
-        if (!message) {
-
-            return res.status(400).json({
-                success: false,
-                error: "Mensagem não informada."
-            });
-
-        }
-
-
-        if (!execucao_id) {
-
-            return res.status(400).json({
-                success: false,
-                error: "execucao_id não informado."
-            });
-
-        }
-
-
-        // ----------------------------------------------------
-        // CRIA EVENTO
-        // ----------------------------------------------------
-
-        const evento = criarEvento({
-            message,
-            level,
-            execucao_id,
-            usuario,
-            detentora,
-            event,
-            timestamp
+      if (!execucao_id) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "execucao_id não informado.",
         });
+      }
 
+      if (!usuario) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "usuario não informado.",
+        });
+      }
 
-        // ----------------------------------------------------
-        // HISTÓRICO
-        // ----------------------------------------------------
+      if (!detentora) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "detentora não informada.",
+        });
+      }
 
-        if (!HISTORICO.has(execucao_id)) {
+      const agora =
+        new Date().toISOString();
 
-            HISTORICO.set(
-                execucao_id,
-                []
-            );
+      let execucao =
+        EXECUCOES.get(
+          execucao_id
+        );
 
+      // ------------------------------------------------------
+      // SE JÁ EXISTE
+      // ------------------------------------------------------
+
+      if (execucao) {
+
+        execucao.usuario =
+          usuario;
+
+        execucao.detentora =
+          detentora;
+
+        if (arquivo) {
+          execucao.arquivo =
+            arquivo;
         }
 
+        execucao.updated_at =
+          agora;
 
-        const historico =
-            HISTORICO.get(execucao_id);
+      }
 
+      // ------------------------------------------------------
+      // NOVA EXECUÇÃO
+      // ------------------------------------------------------
 
-        historico.push(evento);
+      else {
 
+        execucao = {
+          execucao_id,
 
-        // Limita o histórico
-        if (
-            historico.length >
-            MAX_HISTORICO_POR_EXECUCAO
-        ) {
+          usuario,
 
-            historico.splice(
-                0,
-                historico.length -
-                MAX_HISTORICO_POR_EXECUCAO
-            );
+          detentora,
 
-        }
+          arquivo:
+            arquivo || null,
 
+          status: "running",
 
-        // ----------------------------------------------------
-        // LOG NO CONSOLE DO RENDER
-        // ----------------------------------------------------
+          started_at: agora,
+
+          updated_at: agora,
+
+          finished_at: null,
+        };
+
+        EXECUCOES.set(
+          execucao_id,
+          execucao
+        );
+
+        HISTORICO.set(
+          execucao_id,
+          []
+        );
+
+        limitarExecucoes();
 
         console.log(
-            `[${evento.level.toUpperCase()}]`,
-            `[${evento.detentora || "?"}]`,
-            `[${evento.usuario || "?"}]`,
-            evento.message
+          "============================================"
         );
 
-
-        // ----------------------------------------------------
-        // ENVIA PARA OS CLIENTES SSE
-        // ----------------------------------------------------
-
-        enviarParaExecucao(
-            execucao_id,
-            evento
+        console.log(
+          "[EXECUÇÃO] Nova execução"
         );
 
+        console.log(
+          "ID:",
+          execucao_id
+        );
 
-        // ----------------------------------------------------
-        // RESPOSTA
-        // ----------------------------------------------------
+        console.log(
+          "Usuário:",
+          usuario
+        );
 
-        return res.json({
-            success: true,
-            event_id: evento.id
-        });
+        console.log(
+          "Detentora:",
+          detentora
+        );
+
+        console.log(
+          "Arquivo:",
+          arquivo || "-"
+        );
+
+        console.log(
+          "============================================"
+        );
+      }
+
+      // ------------------------------------------------------
+      // EVENTO DE INÍCIO
+      // ------------------------------------------------------
+
+      const evento = criarEvento({
+        execucao_id,
+        usuario,
+        detentora,
+        arquivo,
+        message:
+          "Execução iniciada.",
+        level: "info",
+        event:
+          "execution_started",
+      });
+
+      adicionarEvento(
+        execucao_id,
+        evento
+      );
+
+      return res.json({
+        success: true,
+        execution: execucao,
+      });
 
     } catch (erro) {
 
-        console.error(
-            "Erro ao processar log:",
-            erro
-        );
+      console.error(
+        "Erro ao criar execução:",
+        erro
+      );
 
-        return res.status(500).json({
-            success: false,
-            error: "Erro interno ao processar log."
-        });
-
+      return res.status(500).json({
+        success: false,
+        error:
+          "Erro interno ao criar execução.",
+      });
     }
-
-});
-
+  }
+);
 
 // ============================================================
-// GET /api/logs/stream
-// ============================================================
-//
-// Conexão SSE.
-//
-// Exemplo:
-//
-// /api/logs/stream?execucao_id=ATC-20260909-143201-1234
-//
+// LISTAR EXECUÇÕES
 // ============================================================
 
 app.get(
-    "/api/logs/stream",
-    (req, res) => {
+  "/api/executions",
+  (req, res) => {
 
-        const execucaoId =
-            req.query.execucao_id;
+    const usuario =
+      req.query.usuario;
 
+    const detentora =
+      req.query.detentora;
 
-        if (!execucaoId) {
+    let execucoes =
+      Array.from(
+        EXECUCOES.values()
+      );
 
-            return res.status(400).json({
-                success: false,
-                error: "execucao_id não informado."
-            });
-
-        }
-
-
-        // ----------------------------------------------------
-        // HEADERS SSE
-        // ----------------------------------------------------
-
-        res.setHeader(
-            "Content-Type",
-            "text/event-stream"
+    if (usuario) {
+      execucoes =
+        execucoes.filter(
+          (execucao) =>
+            execucao.usuario
+              ?.toLowerCase() ===
+            usuario.toLowerCase()
         );
-
-        res.setHeader(
-            "Cache-Control",
-            "no-cache, no-transform"
-        );
-
-        res.setHeader(
-            "Connection",
-            "keep-alive"
-        );
-
-        res.setHeader(
-            "X-Accel-Buffering",
-            "no"
-        );
-
-
-        if (res.flushHeaders) {
-            res.flushHeaders();
-        }
-
-
-        // ----------------------------------------------------
-        // REGISTRA CLIENTE
-        // ----------------------------------------------------
-
-        if (!CLIENTES_SSE.has(execucaoId)) {
-
-            CLIENTES_SSE.set(
-                execucaoId,
-                new Set()
-            );
-
-        }
-
-
-        const clientes =
-            CLIENTES_SSE.get(execucaoId);
-
-
-        clientes.add(res);
-
-
-        console.log(
-            `[SSE] Cliente conectado: ${execucaoId}`
-        );
-
-
-        // ----------------------------------------------------
-        // ENVIA HISTÓRICO
-        // ----------------------------------------------------
-
-        const historico =
-            HISTORICO.get(execucaoId) || [];
-
-
-        for (const evento of historico) {
-
-            enviarEventoSSE(
-                res,
-                evento
-            );
-
-        }
-
-
-        // ----------------------------------------------------
-        // EVENTO DE CONEXÃO
-        // ----------------------------------------------------
-
-        enviarEventoSSE(
-            res,
-            {
-                id: gerarIdEvento(),
-                event: "connected",
-                execucao_id: execucaoId,
-                message: "Conectado ao log da execução.",
-                level: "info",
-                timestamp: new Date().toISOString()
-            }
-        );
-
-
-        // ----------------------------------------------------
-        // ENCERRAMENTO
-        // ----------------------------------------------------
-
-        req.on(
-            "close",
-            () => {
-
-                clientes.delete(res);
-
-                console.log(
-                    `[SSE] Cliente desconectado: ${execucaoId}`
-                );
-
-
-                if (
-                    clientes.size === 0
-                ) {
-
-                    CLIENTES_SSE.delete(
-                        execucaoId
-                    );
-
-                }
-
-            }
-        );
-
     }
+
+    if (detentora) {
+      execucoes =
+        execucoes.filter(
+          (execucao) =>
+            execucao.detentora
+              ?.toLowerCase() ===
+            detentora.toLowerCase()
+        );
+    }
+
+    execucoes.sort(
+      (a, b) =>
+        new Date(b.updated_at) -
+        new Date(a.updated_at)
+    );
+
+    res.json({
+      success: true,
+      total: execucoes.length,
+      executions: execucoes,
+    });
+  }
 );
 
+// ============================================================
+// ÚLTIMA EXECUÇÃO DO USUÁRIO
+// ============================================================
+
+app.get(
+  "/api/executions/latest",
+  (req, res) => {
+
+    const usuario =
+      req.query.usuario;
+
+    const detentora =
+      req.query.detentora;
+
+    if (!usuario) {
+      return res.status(400).json({
+        success: false,
+        error:
+          "usuario não informado.",
+      });
+    }
+
+    let execucoes =
+      Array.from(
+        EXECUCOES.values()
+      );
+
+    execucoes =
+      execucoes.filter(
+        (execucao) =>
+          execucao.usuario
+            ?.toLowerCase() ===
+          usuario.toLowerCase()
+      );
+
+    if (detentora) {
+
+      execucoes =
+        execucoes.filter(
+          (execucao) =>
+            execucao.detentora
+              ?.toLowerCase() ===
+            detentora.toLowerCase()
+        );
+    }
+
+    execucoes.sort(
+      (a, b) =>
+        new Date(b.updated_at) -
+        new Date(a.updated_at)
+    );
+
+    if (execucoes.length === 0) {
+
+      return res.json({
+        success: true,
+        execution: null,
+      });
+    }
+
+    return res.json({
+      success: true,
+      execution:
+        execucoes[0],
+    });
+  }
+);
 
 // ============================================================
-// ENVIA EVENTO SSE
+// ATUALIZAR STATUS DA EXECUÇÃO
 // ============================================================
 
-function enviarEventoSSE(
-    response,
-    evento
-) {
+app.post(
+  "/api/executions/:execucao_id/status",
+  (req, res) => {
+
+    const execucaoId =
+      req.params.execucao_id;
+
+    const {
+      status,
+    } = req.body;
+
+    const execucao =
+      EXECUCOES.get(
+        execucaoId
+      );
+
+    if (!execucao) {
+
+      return res.status(404).json({
+        success: false,
+        error:
+          "Execução não encontrada.",
+      });
+    }
+
+    execucao.status =
+      normalizarStatus(status);
+
+    execucao.updated_at =
+      new Date().toISOString();
+
+    if (
+      execucao.status ===
+        "completed" ||
+      execucao.status ===
+        "error" ||
+      execucao.status ===
+        "cancelled"
+    ) {
+
+      execucao.finished_at =
+        new Date().toISOString();
+    }
+
+    let mensagem =
+      "Status da execução atualizado.";
+
+    let nivel = "info";
+
+    if (
+      execucao.status ===
+      "completed"
+    ) {
+
+      mensagem =
+        "Automação concluída com sucesso.";
+
+      nivel = "success";
+    }
+
+    if (
+      execucao.status ===
+      "error"
+    ) {
+
+      mensagem =
+        "Automação finalizada com erro.";
+
+      nivel = "error";
+    }
+
+    if (
+      execucao.status ===
+      "cancelled"
+    ) {
+
+      mensagem =
+        "Automação cancelada.";
+
+      nivel = "warn";
+    }
+
+    const evento = criarEvento({
+      execucao_id:
+        execucaoId,
+
+      usuario:
+        execucao.usuario,
+
+      detentora:
+        execucao.detentora,
+
+      arquivo:
+        execucao.arquivo,
+
+      message:
+        mensagem,
+
+      level: nivel,
+
+      event:
+        "execution_status",
+
+    });
+
+    adicionarEvento(
+      execucaoId,
+      evento
+    );
+
+    return res.json({
+      success: true,
+      execution: execucao,
+    });
+  }
+);
+
+// ============================================================
+// RECEBER LOG
+// ============================================================
+
+app.post(
+  "/api/logs",
+  (req, res) => {
 
     try {
 
-        response.write(
-            `data: ${JSON.stringify(evento)}\n\n`
+      const {
+        message,
+        level,
+        execucao_id,
+        usuario,
+        detentora,
+        arquivo,
+        event,
+        timestamp,
+      } = req.body;
+
+      if (!message) {
+
+        return res.status(400).json({
+          success: false,
+          error:
+            "Mensagem não informada.",
+        });
+      }
+
+      if (!execucao_id) {
+
+        return res.status(400).json({
+          success: false,
+          error:
+            "execucao_id não informado.",
+        });
+      }
+
+      // ------------------------------------------------------
+      // SE A EXECUÇÃO NÃO EXISTE, CRIA
+      // ------------------------------------------------------
+
+      if (
+        !EXECUCOES.has(
+          execucao_id
+        )
+      ) {
+
+        const agora =
+          new Date().toISOString();
+
+        EXECUCOES.set(
+          execucao_id,
+          {
+            execucao_id,
+
+            usuario:
+              usuario || null,
+
+            detentora:
+              detentora || null,
+
+            arquivo:
+              arquivo || null,
+
+            status: "running",
+
+            started_at: agora,
+
+            updated_at: agora,
+
+            finished_at: null,
+          }
         );
+
+        HISTORICO.set(
+          execucao_id,
+          []
+        );
+
+        limitarExecucoes();
+      }
+
+      // ------------------------------------------------------
+      // ATUALIZA EXECUÇÃO
+      // ------------------------------------------------------
+
+      const execucao =
+        EXECUCOES.get(
+          execucao_id
+        );
+
+      if (usuario) {
+        execucao.usuario =
+          usuario;
+      }
+
+      if (detentora) {
+        execucao.detentora =
+          detentora;
+      }
+
+      if (arquivo) {
+        execucao.arquivo =
+          arquivo;
+      }
+
+      execucao.updated_at =
+        new Date().toISOString();
+
+      // ------------------------------------------------------
+      // CRIA EVENTO
+      // ------------------------------------------------------
+
+      const evento = criarEvento({
+        message,
+        level,
+        execucao_id,
+        usuario:
+          usuario ||
+          execucao.usuario,
+
+        detentora:
+          detentora ||
+          execucao.detentora,
+
+        arquivo:
+          arquivo ||
+          execucao.arquivo,
+
+        event,
+        timestamp,
+      });
+
+      adicionarEvento(
+        execucao_id,
+        evento
+      );
+
+      // ------------------------------------------------------
+      // CONSOLE DO RENDER
+      // ------------------------------------------------------
+
+      console.log(
+        `[${evento.level.toUpperCase()}]`,
+        `[${evento.detentora || "?"}]`,
+        `[${evento.usuario || "?"}]`,
+        evento.message
+      );
+
+      return res.json({
+        success: true,
+        event_id:
+          evento.id,
+      });
 
     } catch (erro) {
 
-        console.error(
-            "Erro ao enviar SSE:",
-            erro
-        );
+      console.error(
+        "Erro ao processar log:",
+        erro
+      );
 
+      return res.status(500).json({
+        success: false,
+        error:
+          "Erro interno ao processar log.",
+      });
     }
-
-}
-
+  }
+);
 
 // ============================================================
-// ENVIA PARA UMA EXECUÇÃO
+// ADICIONAR EVENTO
+// ============================================================
+
+function adicionarEvento(
+  execucaoId,
+  evento
+) {
+
+  if (
+    !HISTORICO.has(
+      execucaoId
+    )
+  ) {
+
+    HISTORICO.set(
+      execucaoId,
+      []
+    );
+  }
+
+  const historico =
+    HISTORICO.get(
+      execucaoId
+    );
+
+  historico.push(
+    evento
+  );
+
+  if (
+    historico.length >
+    MAX_HISTORICO_POR_EXECUCAO
+  ) {
+
+    historico.splice(
+      0,
+      historico.length -
+        MAX_HISTORICO_POR_EXECUCAO
+    );
+  }
+
+  enviarParaExecucao(
+    execucaoId,
+    evento
+  );
+}
+
+// ============================================================
+// STREAM SSE
+// ============================================================
+
+app.get(
+  "/api/logs/stream",
+  (req, res) => {
+
+    const execucaoId =
+      req.query.execucao_id;
+
+    if (!execucaoId) {
+
+      return res.status(400).json({
+        success: false,
+        error:
+          "execucao_id não informado.",
+      });
+    }
+
+    // --------------------------------------------------------
+    // HEADERS
+    // --------------------------------------------------------
+
+    res.setHeader(
+      "Content-Type",
+      "text/event-stream"
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-cache, no-transform"
+    );
+
+    res.setHeader(
+      "Connection",
+      "keep-alive"
+    );
+
+    res.setHeader(
+      "X-Accel-Buffering",
+      "no-cache"
+    );
+
+    if (res.flushHeaders) {
+      res.flushHeaders();
+    }
+
+    // --------------------------------------------------------
+    // REGISTRA CLIENTE
+    // --------------------------------------------------------
+
+    if (
+      !CLIENTES_SSE.has(
+        execucaoId
+      )
+    ) {
+
+      CLIENTES_SSE.set(
+        execucaoId,
+        new Set()
+      );
+    }
+
+    const clientes =
+      CLIENTES_SSE.get(
+        execucaoId
+      );
+
+    clientes.add(res);
+
+    console.log(
+      `[SSE] Cliente conectado: ${execucaoId}`
+    );
+
+    // --------------------------------------------------------
+    // ENVIA HISTÓRICO
+    // --------------------------------------------------------
+
+    const historico =
+      HISTORICO.get(
+        execucaoId
+      ) || [];
+
+    for (
+      const evento of historico
+    ) {
+
+      enviarEventoSSE(
+        res,
+        evento
+      );
+    }
+
+    // --------------------------------------------------------
+    // CONFIRMA CONEXÃO
+    // --------------------------------------------------------
+
+    enviarEventoSSE(
+      res,
+      {
+        id: gerarId(),
+
+        event: "connected",
+
+        execucao_id:
+          execucaoId,
+
+        message:
+          "Conectado ao log da execução.",
+
+        level: "info",
+
+        timestamp:
+          new Date().toISOString(),
+      }
+    );
+
+    // --------------------------------------------------------
+    // DESCONECTOU
+    // --------------------------------------------------------
+
+    req.on(
+      "close",
+      () => {
+
+        clientes.delete(
+          res
+        );
+
+        console.log(
+          `[SSE] Cliente desconectado: ${execucaoId}`
+        );
+
+        if (
+          clientes.size === 0
+        ) {
+
+          CLIENTES_SSE.delete(
+            execucaoId
+          );
+        }
+      }
+    );
+  }
+);
+
+// ============================================================
+// ENVIO SSE
+// ============================================================
+
+function enviarEventoSSE(
+  response,
+  evento
+) {
+
+  try {
+
+    response.write(
+      `data: ${JSON.stringify(evento)}\n\n`
+    );
+
+  } catch (erro) {
+
+    console.error(
+      "Erro ao enviar SSE:",
+      erro
+    );
+  }
+}
+
+// ============================================================
+// ENVIA PARA EXECUÇÃO
 // ============================================================
 
 function enviarParaExecucao(
-    execucaoId,
-    evento
+  execucaoId,
+  evento
 ) {
 
-    const clientes =
-        CLIENTES_SSE.get(execucaoId);
+  const clientes =
+    CLIENTES_SSE.get(
+      execucaoId
+    );
 
+  if (!clientes) {
+    return;
+  }
 
-    if (!clientes) {
-        return;
-    }
+  for (
+    const cliente of clientes
+  ) {
 
-
-    for (const cliente of clientes) {
-
-        enviarEventoSSE(
-            cliente,
-            evento
-        );
-
-    }
-
+    enviarEventoSSE(
+      cliente,
+      evento
+    );
+  }
 }
 
-
 // ============================================================
-// CONTADOR DE CLIENTES
+// CONTAR CLIENTES SSE
 // ============================================================
 
 function contarClientes() {
 
-    let total = 0;
+  let total = 0;
 
-    for (
-        const clientes
-        of CLIENTES_SSE.values()
-    ) {
+  for (
+    const clientes of
+      CLIENTES_SSE.values()
+  ) {
 
-        total += clientes.size;
+    total +=
+      clientes.size;
+  }
 
-    }
-
-    return total;
-
+  return total;
 }
 
-
 // ============================================================
-// HEARTBEAT SSE
+// HEARTBEAT
 // ============================================================
-//
-// Render/proxies podem encerrar conexões ociosas.
-// Este heartbeat mantém a conexão viva.
-//
 
 setInterval(
-    () => {
+  () => {
 
-        for (
-            const clientes
-            of CLIENTES_SSE.values()
-        ) {
+    for (
+      const clientes of
+        CLIENTES_SSE.values()
+    ) {
 
-            for (
-                const cliente
-                of clientes
-            ) {
+      for (
+        const cliente of
+          clientes
+      ) {
 
-                try {
+        try {
 
-                    cliente.write(
-                        `: heartbeat ${Date.now()}\n\n`
-                    );
+          cliente.write(
+            `: heartbeat ${Date.now()}\n\n`
+          );
 
-                } catch (erro) {
-
-                    // Cliente será removido pelo close.
-                }
-
-            }
-
+        } catch (erro) {
+          // conexão encerrada
         }
+      }
+    }
 
-    },
-    25000
+  },
+  25000
 );
-
 
 // ============================================================
 // TRATAMENTO DE ERROS
 // ============================================================
 
 process.on(
-    "uncaughtException",
-    (erro) => {
+  "uncaughtException",
+  (erro) => {
 
-        console.error(
-            "UNCAUGHT EXCEPTION:",
-            erro
-        );
-
-    }
+    console.error(
+      "UNCAUGHT EXCEPTION:",
+      erro
+    );
+  }
 );
-
 
 process.on(
-    "unhandledRejection",
-    (erro) => {
+  "unhandledRejection",
+  (erro) => {
 
-        console.error(
-            "UNHANDLED REJECTION:",
-            erro
-        );
-
-    }
+    console.error(
+      "UNHANDLED REJECTION:",
+      erro
+    );
+  }
 );
-
 
 // ============================================================
 // INICIAR SERVIDOR
 // ============================================================
 
 app.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
+  PORT,
+  "0.0.0.0",
+  () => {
 
-        console.log(
-            "============================================"
-        );
+    console.log(
+      "============================================"
+    );
 
-        console.log(
-            "SGA BACKEND INICIADO"
-        );
+    console.log(
+      "SGA BACKEND INICIADO"
+    );
 
-        console.log(
-            `Porta: ${PORT}`
-        );
+    console.log(
+      `Porta: ${PORT}`
+    );
 
-        console.log(
-            "============================================"
-        );
-
-    }
+    console.log(
+      "============================================"
+    );
+  }
 );

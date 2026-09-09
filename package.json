@@ -1,6 +1,6 @@
 {
   "name": "sga-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Backend do SGA com logs de automação em tempo real",
   "main": "server.js",
   "scripts": {
