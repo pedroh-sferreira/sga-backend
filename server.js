@@ -93,6 +93,9 @@ function criarEvento(dados) {
     arquivo:
       dados.arquivo || null,
 
+    protocolo:
+      dados.protocolo || null,
+
     message:
       String(dados.message || ""),
 
@@ -145,6 +148,10 @@ function limitarExecucoes() {
     HISTORICO.delete(
       execucao.execucao_id
     );
+
+    CLIENTES_SSE.delete(
+      execucao.execucao_id
+    );
   }
 }
 
@@ -156,7 +163,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "online",
     service: "SGA Backend",
-    version: "2.0.0",
+    version: "2.1.0",
     timestamp:
       new Date().toISOString(),
   });
@@ -182,7 +189,7 @@ app.get("/health", (req, res) => {
 });
 
 // ============================================================
-// CRIAR EXECUÇÃO
+// CRIAR / REGISTRAR EXECUÇÃO
 // ============================================================
 
 app.post(
@@ -196,6 +203,7 @@ app.post(
         usuario,
         detentora,
         arquivo,
+        protocolo,
       } = req.body;
 
       if (!execucao_id) {
@@ -247,6 +255,11 @@ app.post(
             arquivo;
         }
 
+        if (protocolo) {
+          execucao.protocolo =
+            protocolo;
+        }
+
         execucao.updated_at =
           agora;
 
@@ -267,6 +280,9 @@ app.post(
 
           arquivo:
             arquivo || null,
+
+          protocolo:
+            protocolo || null,
 
           status: "running",
 
@@ -318,6 +334,11 @@ app.post(
         );
 
         console.log(
+          "Protocolo:",
+          protocolo || "-"
+        );
+
+        console.log(
           "============================================"
         );
       }
@@ -331,9 +352,16 @@ app.post(
         usuario,
         detentora,
         arquivo,
+
+        protocolo:
+          protocolo ||
+          execucao.protocolo,
+
         message:
           "Execução iniciada.",
+
         level: "info",
+
         event:
           "execution_started",
       });
@@ -493,116 +521,171 @@ app.post(
   "/api/executions/:execucao_id/status",
   (req, res) => {
 
-    const execucaoId =
-      req.params.execucao_id;
+    try {
 
-    const {
-      status,
-    } = req.body;
+      const execucaoId =
+        req.params.execucao_id;
 
-    const execucao =
-      EXECUCOES.get(
-        execucaoId
+      const {
+        status,
+        usuario,
+        detentora,
+        arquivo,
+        protocolo,
+      } = req.body;
+
+      const execucao =
+        EXECUCOES.get(
+          execucaoId
+        );
+
+      if (!execucao) {
+
+        return res.status(404).json({
+          success: false,
+          error:
+            "Execução não encontrada.",
+        });
+      }
+
+      // ------------------------------------------------------
+      // ATUALIZA DADOS OPCIONAIS
+      // ------------------------------------------------------
+
+      if (usuario) {
+        execucao.usuario =
+          usuario;
+      }
+
+      if (detentora) {
+        execucao.detentora =
+          detentora;
+      }
+
+      if (arquivo) {
+        execucao.arquivo =
+          arquivo;
+      }
+
+      if (protocolo) {
+        execucao.protocolo =
+          protocolo;
+      }
+
+      // ------------------------------------------------------
+      // STATUS
+      // ------------------------------------------------------
+
+      execucao.status =
+        normalizarStatus(status);
+
+      execucao.updated_at =
+        new Date().toISOString();
+
+      if (
+        execucao.status ===
+          "completed" ||
+        execucao.status ===
+          "error" ||
+        execucao.status ===
+          "cancelled"
+      ) {
+
+        execucao.finished_at =
+          new Date().toISOString();
+      }
+
+      let mensagem =
+        "Status da execução atualizado.";
+
+      let nivel = "info";
+
+      if (
+        execucao.status ===
+        "completed"
+      ) {
+
+        mensagem =
+          "Automação concluída com sucesso.";
+
+        nivel = "success";
+      }
+
+      if (
+        execucao.status ===
+        "error"
+      ) {
+
+        mensagem =
+          "Automação finalizada com erro.";
+
+        nivel = "error";
+      }
+
+      if (
+        execucao.status ===
+        "cancelled"
+      ) {
+
+        mensagem =
+          "Automação cancelada.";
+
+        nivel = "warn";
+      }
+
+      const evento = criarEvento({
+        execucao_id:
+          execucaoId,
+
+        usuario:
+          execucao.usuario,
+
+        detentora:
+          execucao.detentora,
+
+        arquivo:
+          execucao.arquivo,
+
+        protocolo:
+          execucao.protocolo,
+
+        message:
+          mensagem,
+
+        level:
+          nivel,
+
+        event:
+          "execution_status",
+      });
+
+      adicionarEvento(
+        execucaoId,
+        evento
       );
 
-    if (!execucao) {
+      console.log(
+        `[EXECUÇÃO] Status atualizado | ${execucaoId} | ${execucao.status} | protocolo: ${execucao.protocolo || "-"}`
+      );
 
-      return res.status(404).json({
+      return res.json({
+        success: true,
+        execution: execucao,
+      });
+
+    } catch (erro) {
+
+      console.error(
+        "Erro ao atualizar status:",
+        erro
+      );
+
+      return res.status(500).json({
         success: false,
         error:
-          "Execução não encontrada.",
+          "Erro interno ao atualizar status.",
       });
     }
-
-    execucao.status =
-      normalizarStatus(status);
-
-    execucao.updated_at =
-      new Date().toISOString();
-
-    if (
-      execucao.status ===
-        "completed" ||
-      execucao.status ===
-        "error" ||
-      execucao.status ===
-        "cancelled"
-    ) {
-
-      execucao.finished_at =
-        new Date().toISOString();
-    }
-
-    let mensagem =
-      "Status da execução atualizado.";
-
-    let nivel = "info";
-
-    if (
-      execucao.status ===
-      "completed"
-    ) {
-
-      mensagem =
-        "Automação concluída com sucesso.";
-
-      nivel = "success";
-    }
-
-    if (
-      execucao.status ===
-      "error"
-    ) {
-
-      mensagem =
-        "Automação finalizada com erro.";
-
-      nivel = "error";
-    }
-
-    if (
-      execucao.status ===
-      "cancelled"
-    ) {
-
-      mensagem =
-        "Automação cancelada.";
-
-      nivel = "warn";
-    }
-
-    const evento = criarEvento({
-      execucao_id:
-        execucaoId,
-
-      usuario:
-        execucao.usuario,
-
-      detentora:
-        execucao.detentora,
-
-      arquivo:
-        execucao.arquivo,
-
-      message:
-        mensagem,
-
-      level: nivel,
-
-      event:
-        "execution_status",
-
-    });
-
-    adicionarEvento(
-      execucaoId,
-      evento
-    );
-
-    return res.json({
-      success: true,
-      execution: execucao,
-    });
   }
 );
 
@@ -623,6 +706,7 @@ app.post(
         usuario,
         detentora,
         arquivo,
+        protocolo,
         event,
         timestamp,
       } = req.body;
@@ -672,6 +756,9 @@ app.post(
             arquivo:
               arquivo || null,
 
+            protocolo:
+              protocolo || null,
+
             status: "running",
 
             started_at: agora,
@@ -714,6 +801,11 @@ app.post(
           arquivo;
       }
 
+      if (protocolo) {
+        execucao.protocolo =
+          protocolo;
+      }
+
       execucao.updated_at =
         new Date().toISOString();
 
@@ -723,8 +815,11 @@ app.post(
 
       const evento = criarEvento({
         message,
+
         level,
+
         execucao_id,
+
         usuario:
           usuario ||
           execucao.usuario,
@@ -737,7 +832,12 @@ app.post(
           arquivo ||
           execucao.arquivo,
 
+        protocolo:
+          protocolo ||
+          execucao.protocolo,
+
         event,
+
         timestamp,
       });
 
@@ -754,13 +854,21 @@ app.post(
         `[${evento.level.toUpperCase()}]`,
         `[${evento.detentora || "?"}]`,
         `[${evento.usuario || "?"}]`,
+        evento.protocolo
+          ? `[PROTOCOLO: ${evento.protocolo}]`
+          : "",
         evento.message
       );
 
       return res.json({
         success: true,
+
         event_id:
           evento.id,
+
+        protocolo:
+          execucao.protocolo ||
+          null,
       });
 
     } catch (erro) {
@@ -1121,6 +1229,10 @@ app.listen(
 
     console.log(
       "SGA BACKEND INICIADO"
+    );
+
+    console.log(
+      "Versão: 2.1.0"
     );
 
     console.log(
